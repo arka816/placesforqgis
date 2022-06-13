@@ -127,3 +127,18 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# qgis plugin
+help/
+i18n/
+scripts/
+test/
+
+# vscode settings folder
+.vscode
+
+# configuration file
+.conf
+
+# log file
+.logfile
