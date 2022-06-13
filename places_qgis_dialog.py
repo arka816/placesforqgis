@@ -51,8 +51,9 @@ XLSX_COL_WIDTHS = {
 }
 
 METADATA_DOWNLOAD_PROGRESS = 10
+IMAGE_DOWNLOAD_PROGRESS = 30
 FILE_WRITE_PROGRESS = 5
-NPT_VALIDITY_DELAY = 5
+NPT_VALIDITY_DELAY = 5      # time taken for next page token to be valid after being issued
 CHUNK_SIZE = 4096
 
 # This loads your .ui file so that PyQt can populate your plugin with the elements from Qt Designer
@@ -93,7 +94,8 @@ class PlacesQgisDialog(QtWidgets.QDialog, FORM_CLASS):
             'RADIUS': self.radius,
             'KEYWORD': self.keyword,
             'SAVE_LOG': self.saveLogCheck,
-            'SAVE_IMAGES': self.saveImages
+            'SAVE_IMAGES': self.saveImages,
+            'LIMIT_ENTRIES': self.limitEntries
         }
 
         self.configFilePath = os.path.join(os.path.dirname(__file__), ".conf")
@@ -219,6 +221,11 @@ class PlacesQgisDialog(QtWidgets.QDialog, FORM_CLASS):
             elem.setFocus()
             elem.selectAll()
 
+        def limit_error(elem):
+            QMessageBox.warning(self, "Error", "entry limit cannot be negative")
+            elem.setFocus()
+            elem.selectAll()
+
         if not self.isDownloadInProgress:
             # collect data
             try:
@@ -236,6 +243,14 @@ class PlacesQgisDialog(QtWidgets.QDialog, FORM_CLASS):
 
             if not (-180 <= longitude <= 180):
                 long_error(self.longitude)
+
+            try:
+                limitEntries = int(self.limitEntries.text())
+            except Exception as ex:
+                float_error(self.limitEntries, "limit entries")
+
+            if limitEntries < 0:
+                limit_error(self.limitEntries)
 
             try:
                 radius = int(self.radius.text())
@@ -268,7 +283,7 @@ class PlacesQgisDialog(QtWidgets.QDialog, FORM_CLASS):
 
             
             if ('latitude' in locals()) and ('longitude' in locals()) and ('radius' in locals()) and\
-                -180 <= longitude <= 180 and -90 <= latitude <= 90 and\
+                -180 <= longitude <= 180 and -90 <= latitude <= 90 and limitEntries >= 0 and\
                 len(gapiKey) != 0 and len(keyword) != 0 and len(xlsxFilePath) != 0 and len(outputDirName) != 0:
 
                 # no error in input; set download thread in progress
@@ -283,7 +298,7 @@ class PlacesQgisDialog(QtWidgets.QDialog, FORM_CLASS):
 
                 # create worker
                 self.thread = QThread()
-                self.worker = Worker(latitude, longitude, radius, xlsxFilePath, gapiKey, keyword, outputDirName, self.saveImages.isChecked())
+                self.worker = Worker(latitude, longitude, radius, xlsxFilePath, gapiKey, keyword, outputDirName, self.saveImages.isChecked(), limitEntries)
                 self.worker.moveToThread(self.thread)
 
                 # connect signals to slots
@@ -422,7 +437,7 @@ class Worker(QObject):
     addError = pyqtSignal(str)
     total = pyqtSignal(int)
 
-    def __init__(self, latitude, longitude, radius, xlsxFilePath, gapiKey, keyword, outputDirName, saveImages):
+    def __init__(self, latitude, longitude, radius, xlsxFilePath, gapiKey, keyword, outputDirName, saveImages, limitEntries):
         QObject.__init__(self)
         self.lat = latitude
         self.long = longitude
@@ -432,9 +447,11 @@ class Worker(QObject):
         self.keyword = keyword
         self.outputDirName = outputDirName
         self.saveImages = saveImages
+        self.limitEntries = limitEntries
 
         self.running = None
-        self.downloadCount = 0
+        self.placeDownloadCount = 0
+        self.imageDownloadCount = 0
 
         self.imageBaseURL = "https://maps.googleapis.com/maps/api/place/photo"
 
@@ -456,7 +473,7 @@ class Worker(QObject):
         self.addMessage.emit(f"searching for nearby places...")
         results = []
         
-        while True:
+        while len(results) <= self.limitEntries:
             res = requests.get(url, params=params)
             data = res.json()
 
@@ -475,11 +492,11 @@ class Worker(QObject):
             # wait for next page token to be valid
             time.sleep(NPT_VALIDITY_DELAY)
 
-        return results
+        return results[:self.limitEntries]
 
     def _get_reviews(self, place_id):
-        self.downloadCount += 1
-        self.progress.emit(self.downloadCount)
+        self.placeDownloadCount += 1
+        self.progress.emit(int(METADATA_DOWNLOAD_PROGRESS + (100 - METADATA_DOWNLOAD_PROGRESS - IMAGE_DOWNLOAD_PROGRESS) * self.placeDownloadCount / self.countPlaces))
 
         if not self.running:
             self.halt_error()
@@ -515,7 +532,9 @@ class Worker(QObject):
 
     def _get_photos(self, place_id, photos):
         index = 1
-        for photo in photos:
+        for photo in photos:   
+            self.imageDownloadCount += 1
+            self.progress.emit(int((100 - IMAGE_DOWNLOAD_PROGRESS) + IMAGE_DOWNLOAD_PROGRESS * self.imageDownloadCount / self.countImages))
             if not self.running:
                 self.halt_error()
                 return
@@ -549,13 +568,15 @@ class Worker(QObject):
         self.finished.emit(pd.DataFrame())
 
     def run(self):
-        self.downloadCount = 0
+        self.placeDownloadCount = 0
         self.running = True
-
+        self.total.emit(100)
 
         # download nearby places
         places = self._search_places()
-        self.total.emit(len(places))
+        self.countPlaces = len(places)
+
+        self.progress.emit(METADATA_DOWNLOAD_PROGRESS)
 
         if not self.running:
             self.halt_error()
@@ -610,14 +631,17 @@ class Worker(QObject):
             reviews = place['data']['reviews']
             numReviews = len(reviews)
             col = 'A'
-            worksheet.merge_range(f"{col}{currRow}:{col}{currRow + numReviews - 1}", index)
+            if numReviews > 1:
+                worksheet.merge_range(f"{col}{currRow}:{col}{currRow + numReviews - 1}", index)
             col = chr(ord(col) + 1)
 
             for data in place[placeData.columns[:4]]:
-                worksheet.merge_range(f"{col}{currRow}:{col}{currRow + numReviews - 1}", data)
+                if numReviews > 1:
+                    worksheet.merge_range(f"{col}{currRow}:{col}{currRow + numReviews - 1}", data)
                 col = chr(ord(col) + 1)
 
-            worksheet.merge_range(f"{col}{currRow}:{col}{currRow + numReviews - 1}", ', '.join(place['types']))
+            if numReviews > 1:
+                worksheet.merge_range(f"{col}{currRow}:{col}{currRow + numReviews - 1}", ', '.join(place['types']))
             col = chr(ord(col) + 1)
 
             for review in reviews:
@@ -636,12 +660,23 @@ class Worker(QObject):
         except Exception as ex:
             self.addError.emit(f"Error writing to excel file. {ex}")
 
-        if self.saveImages:
-            self.addMessage.emit("downloading images...")
+        # download all images
+
+
+        if self.saveImages:   
+            # count number of images
+            self.countImages = 0
+            for _, place in placeData.iterrows():
+                if 'photos' in place['data']:
+                    self.countImages += len(place['data']['photos'])
+
+            self.addMessage.emit(f"downloading {self.countImages} images...")
             for _, place in placeData.iterrows():
                 if 'photos' in place['data']:
                     self._get_photos(place['place_id'], place['data']['photos'])
-            self.addMessage.emit("downloaded all images")
+            self.addMessage.emit(f"downloaded all {self.countImages} images")
+        else:
+            self.progress.emit(100)
 
         self.finished.emit(placeData)
         return
