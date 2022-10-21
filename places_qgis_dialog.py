@@ -80,6 +80,12 @@ class PlacesQgisDialog(QtWidgets.QDialog, FORM_CLASS):
             'LIMIT_ENTRIES': self.limitEntries
         }
 
+        self.api_report_map = {
+            'NEARBY': self.nearbysearchUsage,
+            'REVIEWS': self.reviewsUsage,
+            'PHOTOS': self.photosUsage
+        }
+
         self.configFilePath = os.path.join(os.path.dirname(__file__), ".conf")
         self.logFilePath = os.path.join(os.path.dirname(__file__), ".logfile")
         self.usageFilePath = os.path.join(os.path.dirname(__file__), "usage.dat")
@@ -95,7 +101,10 @@ class PlacesQgisDialog(QtWidgets.QDialog, FORM_CLASS):
         # load previous user input
         self._load_prev_input()
 
-        # connect to input saver
+        # load api usage data
+        self._show_api_usage()
+
+        # connect to input saver, cleanup and log saver
         self.rejected.connect(self._save_input)
         self.rejected.connect(self._cleanup)
         self.rejected.connect(self._save_log)
@@ -330,7 +339,7 @@ class PlacesQgisDialog(QtWidgets.QDialog, FORM_CLASS):
             'size_unit': 'RenderMetersInMapUnits',
             'outline_color': '35,35,35,255', 
             'outline_style': 'solid', 
-            'outline_width': '100',
+            'outline_width': '10',
             'outline_width_unit': 'RenderMetersInMapUnits'
         })
         
@@ -411,28 +420,54 @@ class PlacesQgisDialog(QtWidgets.QDialog, FORM_CLASS):
     def _total_from_worker(self, total):
         self.progressBar.setMaximum(int(total))
 
+    def _show_api_usage(self):
+        if os.path.exists(self.usageFilePath):
+            f = open(self.usageFilePath, 'r')
+            
+            for line in f.readlines():
+                key, val = line.strip("\n").split("=")
+                if key != 'LASTDATE':
+                    self.api_report_map[key].setText(val)
+
     def _report_api_usage(self, usage):
         if os.path.exists(self.usageFilePath):
-            f = open(self.usageFilePath, 'r+')
+            f = open(self.usageFilePath, 'r')
             l = []
 
             for line in f.readlines():
                 key, val = line.strip("\n").split("=")
                 if key != 'LASTDATE':
-                    usage[key] += val
+                    usage[key] += int(val)
                     l.append(f"{key}={usage[key]}")
                 else:
                     currMonth = datetime.now().month
                     if currMonth != val:
                         # reset api usage data
                         l = ["NEARBY=0", "REVIEWS=0", "PHOTOS=0"]
+                        for key in usage:
+                            usage[key] = 0
                     
             l.append(f"LASTDATE={datetime.now().month}")
+            f.close()
 
+            f = open(self.usageFilePath, 'w')
             f.truncate(0)
+            f.write('\n'.join(l))
+            f.close()
+        else:
+            f = open(self.usageFilePath, 'w')
+            l = []
+
+            for key, val in usage.items():
+                l.append(f"{key}={val}")
+
+            l.append(f"LASTDATE={datetime.now().month}")
 
             f.write('\n'.join(l))
             f.close()
+        
+        self._show_api_usage()
+            
             
 
 
@@ -635,19 +670,18 @@ class Worker(QObject):
         if not self.running:
             self.halt_error()
 
-        # flush data to xlsx file
+        # FLUSH DATA TO XLSX FILE
         self.addMessage.emit(f"flushing {len(placeData)} places to excel workbook...")
         workbook = xlsxwriter.Workbook(self.xlsxFilePath)
-        worksheet = workbook.add_worksheet('reviews')
-
-        currRow = 0
 
         bold = workbook.add_format({'bold': True})
 
-        # write column names in bold
-        worksheet.write(currRow, 0, "No.", bold)
+        # FORMATTED WORKSHEET
+        worksheet_formatted = workbook.add_worksheet('reviews-formatted')
+        currRow = 0
+        worksheet_formatted.write(currRow, 0, "No.", bold)
         for index, colName in enumerate(list(placeData.columns[:5]) + ["author", "comment", "timestamp"]):
-            worksheet.write(currRow, index+1, colName, bold)
+            worksheet_formatted.write(currRow, index+1, colName, bold)
         
         currRow = 2
 
@@ -658,27 +692,54 @@ class Worker(QObject):
             numReviews = len(reviews)
             col = 'A'
             if numReviews > 1:
-                worksheet.merge_range(f"{col}{currRow}:{col}{currRow + numReviews - 1}", index)
+                worksheet_formatted.merge_range(f"{col}{currRow}:{col}{currRow + numReviews - 1}", index)
             col = chr(ord(col) + 1)
 
             for data in place[placeData.columns[:4]]:
                 if numReviews > 1:
-                    worksheet.merge_range(f"{col}{currRow}:{col}{currRow + numReviews - 1}", data)
+                    worksheet_formatted.merge_range(f"{col}{currRow}:{col}{currRow + numReviews - 1}", data)
                 col = chr(ord(col) + 1)
 
             if numReviews > 1:
-                worksheet.merge_range(f"{col}{currRow}:{col}{currRow + numReviews - 1}", ', '.join(place['types']))
+                worksheet_formatted.merge_range(f"{col}{currRow}:{col}{currRow + numReviews - 1}", ', '.join(place['types']))
             col = chr(ord(col) + 1)
 
             for review in reviews:
-                worksheet.write(currRow - 1, 6, review['author_name'])
-                worksheet.write(currRow - 1, 7, review['text'])
-                worksheet.write(currRow - 1, 8, datetime.utcfromtimestamp(review['time']).strftime('%A, %d %B, %Y'))
+                worksheet_formatted.write(currRow - 1, 6, review['author_name'])
+                worksheet_formatted.write(currRow - 1, 7, review['text'])
+                worksheet_formatted.write(currRow - 1, 8, datetime.utcfromtimestamp(review['time']).strftime('%A, %d %B, %Y'))
+                currRow += 1
+
+        # UNFORMATTED WORKSHEET
+        worksheet_unformatted = workbook.add_worksheet('reviews-unformatted')
+        currRow = 0
+        worksheet_unformatted.write(currRow, 0, "No.", bold)
+        for index, colName in enumerate(list(placeData.columns[:5]) + ["author", "comment", "timestamp"]):
+            worksheet_unformatted.write(currRow, index+1, colName, bold)
+        
+        currRow = 1
+
+        for index, place in placeData.iterrows():
+            if not self.running:
+                self.halt_error()
+            reviews = place['data']['reviews']
+           
+            for review in reviews:
+                worksheet_unformatted.write(currRow, 0, index)
+                worksheet_unformatted.write(currRow, 1, place['lat'])
+                worksheet_unformatted.write(currRow, 2, place['long'])
+                worksheet_unformatted.write(currRow, 3, place['name'])
+                worksheet_unformatted.write(currRow, 4, place['place_id'])
+                worksheet_unformatted.write(currRow, 5, ', '.join(place['types']))
+                worksheet_unformatted.write(currRow, 6, review['author_name'])
+                worksheet_unformatted.write(currRow, 7, review['text'])
+                worksheet_unformatted.write(currRow, 8, datetime.utcfromtimestamp(review['time']).strftime('%A, %d %B, %Y'))
                 currRow += 1
 
         # widen columns to improve readability
         for col, width in XLSX_COL_WIDTHS.items():
-            worksheet.set_column(f"{col}:{col}", width)
+            worksheet_formatted.set_column(f"{col}:{col}", width)
+            worksheet_unformatted.set_column(f"{col}:{col}", width)
 
         try:
             workbook.close()
@@ -687,8 +748,6 @@ class Worker(QObject):
             self.addError.emit(f"Error writing to excel file. {ex}")
 
         # download all images
-
-
         if self.saveImages:   
             # count number of images
             self.countImages = 0
